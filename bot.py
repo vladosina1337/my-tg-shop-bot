@@ -3,8 +3,11 @@ Telegram-бот + HTTP API для приёма заказов из Telegram Mini
 Библиотеки: aiogram 3.x (вместе с ним ставится aiohttp)
 
 Заказ приходит двумя путями:
-  1) POST /api/order  — основной (fetch из Mini App, работает и через Menu Button)
+  1) POST /api/order  — основной (fetch из Mini App)
   2) web_app_data     — запасной (sendData, работает только с кнопкой-клавиатурой из /start)
+
+Если подпись Telegram (initData) не прошла проверку, заказ всё равно принимается
+как от «Гостя», а админ видит в отчёте пометку, что личность не подтверждена.
 
 Запуск:
     pip install -U aiogram
@@ -19,7 +22,7 @@ import json
 import logging
 import os
 import time
-from urllib.parse import parse_qsl, urlparse
+from urllib.parse import parse_qsl
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
@@ -41,13 +44,12 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "123456789"))               # ваш Telegr
 WEBAPP_URL = os.getenv("WEBAPP_URL", "https://your-app.vercel.app")  # ссылка на Mini App (только https)
 PORT = int(os.getenv("PORT", "8080"))                            # порт веб-сервера (Render задаёт PORT сам)
 
-# Откуда разрешены запросы к API (CORS). По умолчанию — домен вашего Mini App.
-# Если домен на Vercel другой, задайте переменную окружения ALLOWED_ORIGIN.
-_parsed = urlparse(WEBAPP_URL)
-ALLOWED_ORIGIN = os.getenv("ALLOWED_ORIGIN", f"{_parsed.scheme}://{_parsed.netloc}")
+# CORS: откуда разрешены запросы к API. "*" — с любого домена (cookies не используются, так что это безопасно).
+ALLOWED_ORIGIN = os.getenv("ALLOWED_ORIGIN", "*")
 
-INIT_DATA_MAX_AGE = 24 * 60 * 60  # initData старше суток считаем недействительным
-MAX_ITEMS = 100
+INIT_DATA_MAX_AGE = 24 * 60 * 60   # initData старше суток считаем недействительным
+MAX_ITEMS = 100                    # максимум позиций в заказе
+GUEST_LIMIT_PER_MIN = 5            # сколько заказов в минуту принимаем с одного IP БЕЗ подтверждённой подписи
 
 THANKS_TEXT = "Спасибо за заказ! Администратор уже принял его в работу и свяжется с вами."
 # ============================================================
@@ -77,43 +79,65 @@ def money(value) -> str:
 
 def validate_init_data(init_data, bot_token: str, max_age: int = INIT_DATA_MAX_AGE):
     """
-    Проверяет подпись Telegram.WebApp.initData (HMAC-SHA256) по алгоритму из документации Telegram.
-    Возвращает словарь пользователя (id, first_name, username...) или None, если данные поддельные.
+    Проверяет подпись Telegram.WebApp.initData (HMAC-SHA256).
+    Возвращает (user, None) если всё в порядке, иначе (None, причина_для_логов).
     """
     if not isinstance(init_data, str) or not init_data:
-        return None
+        return None, "initData пустой"
     try:
         pairs = dict(parse_qsl(init_data, keep_blank_values=True, strict_parsing=True))
     except ValueError:
-        return None
+        return None, "initData в неверном формате"
 
     received_hash = pairs.pop("hash", None)
     if not received_hash:
-        return None
+        return None, "в initData нет hash"
 
     data_check_string = "\n".join(f"{k}={v}" for k, v in sorted(pairs.items()))
     secret_key = hmac.new(b"WebAppData", bot_token.encode(), hashlib.sha256).digest()
     calculated_hash = hmac.new(secret_key, data_check_string.encode(), hashlib.sha256).hexdigest()
     if not hmac.compare_digest(calculated_hash, received_hash):
-        return None
+        return None, "подпись не совпала (проверьте, что BOT_TOKEN на сервере — токен того же бота, из которого открыт Mini App)"
 
     try:
         auth_date = int(pairs.get("auth_date", "0"))
     except ValueError:
-        return None
+        return None, "в initData неверный auth_date"
     if time.time() - auth_date > max_age:
-        return None
+        return None, "initData устарел (старше суток)"
 
     try:
         user = json.loads(pairs.get("user", ""))
     except (json.JSONDecodeError, TypeError):
-        return None
+        return None, "в initData нет данных пользователя"
     if not isinstance(user, dict) or "id" not in user:
-        return None
-    return user
+        return None, "в initData нет id пользователя"
+    return user, None
 
 
-def build_order_report(data: dict, user: dict) -> str:
+# Простейший ограничитель для заказов без подтверждённой подписи (защита админа от спама)
+_guest_hits: dict = {}
+
+
+def guest_rate_limited(ip: str, limit: int = GUEST_LIMIT_PER_MIN, window: int = 60) -> bool:
+    now = time.time()
+    if len(_guest_hits) > 1000:
+        _guest_hits.clear()
+    hits = [t for t in _guest_hits.get(ip, []) if now - t < window]
+    if len(hits) >= limit:
+        _guest_hits[ip] = hits
+        return True
+    hits.append(now)
+    _guest_hits[ip] = hits
+    return False
+
+
+def client_ip(request: web.Request) -> str:
+    forwarded = request.headers.get("X-Forwarded-For", "").split(",")[0].strip()
+    return forwarded or request.remote or "unknown"
+
+
+def build_order_report(data: dict, user=None) -> str:
     """
     Формирует текст заказа для администратора.
 
@@ -121,28 +145,46 @@ def build_order_report(data: dict, user: dict) -> str:
     {
       "items": [ { "name": "Карбоновая ткань 3K", "quantity": 2, "price": 1500 } ],
       "total": 3000,
-      "client": { "phone": "...", "city": "...", "address": "...", "comment": "..." }  // необязательно
+      "client": { "name": "...", "username": "...", "phone": "...", "city": "...", "address": "...", "comment": "..." }
     }
-    user — данные Telegram-пользователя (id, first_name, last_name, username).
-    ID и username берутся из проверенных данных Telegram, а не из JSON заказа.
+    user — проверенные данные Telegram-пользователя (id, first_name, last_name, username)
+           или None, если подпись не подтверждена (тогда клиент считается Гостем).
     """
     client = data.get("client")
     if not isinstance(client, dict):
         client = {}
     items = [i for i in (data.get("items") or []) if isinstance(i, dict)]
 
-    full_name = " ".join(filter(None, [user.get("first_name"), user.get("last_name")]))
-    username = f"@{user['username']}" if user.get("username") else "нет username"
-
     # --- Данные клиента ---
-    lines = [
-        "🛒 <b>НОВЫЙ ЗАКАЗ</b>",
-        "",
-        "👤 <b>Клиент</b>",
-        f"Имя: {esc(client.get('name') or full_name)}",
-        f"Telegram: {esc(username)}",
-        f"ID: <code>{user['id']}</code>",
-    ]
+    if user is not None:
+        full_name = " ".join(filter(None, [user.get("first_name"), user.get("last_name")]))
+        username = f"@{user['username']}" if user.get("username") else "нет username"
+        lines = [
+            "🛒 <b>НОВЫЙ ЗАКАЗ</b>",
+            "",
+            "👤 <b>Клиент</b>",
+            f"Имя: {esc(client.get('name') or full_name)}",
+            f"Telegram: {esc(username)}",
+            f"ID: <code>{user['id']}</code>",
+        ]
+    else:
+        claimed_name = client.get("name")
+        if claimed_name in (None, "", "Покупатель"):
+            claimed_name = "Гость"
+        lines = [
+            "🛒 <b>НОВЫЙ ЗАКАЗ</b>",
+            "",
+            "👤 <b>Клиент: Гость</b>",
+            "⚠️ Telegram не подтвердил личность — данные ниже указал сам клиент, им нельзя полностью доверять.",
+            f"Имя: {esc(claimed_name)}",
+        ]
+        claimed_username = client.get("username")
+        if claimed_username and claimed_username != "Без username":
+            lines.append(f"Telegram (не проверено): {esc(claimed_username)}")
+        claimed_id = client.get("id")
+        if claimed_id not in (None, "", "Неизвестно"):
+            lines.append(f"ID (не проверено): {esc(claimed_id)}")
+
     for key, label in (("phone", "Телефон"), ("city", "Город"), ("address", "Адрес / ТК")):
         if client.get(key):
             lines.append(f"{label}: {esc(client[key])}")
@@ -227,33 +269,42 @@ async def handle_web_app_order(message: Message, bot: Bot):
 
 # ---------- HTTP API (aiohttp) ----------
 
-@web.middleware
-async def cors_middleware(request: web.Request, handler):
-    """Разрешает запросы из Mini App (другой домен) и отвечает на preflight-запрос OPTIONS."""
-    if request.method == "OPTIONS":
-        response = web.Response(status=204)
-    else:
-        try:
-            response = await handler(request)
-        except web.HTTPException as exc:
-            response = exc
-
-    origin = request.headers.get("Origin")
-    if origin and origin == ALLOWED_ORIGIN:
-        response.headers["Access-Control-Allow-Origin"] = origin
-        response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-        response.headers["Access-Control-Allow-Headers"] = "Content-Type"
-        response.headers["Access-Control-Max-Age"] = "86400"
-        response.headers["Vary"] = "Origin"
-    return response
-
-
 def error(message: str, status: int) -> web.Response:
     return web.json_response({"status": "error", "message": message}, status=status)
 
 
+CORS_HEADERS = {
+    "Access-Control-Allow-Origin": ALLOWED_ORIGIN,
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+    "Access-Control-Max-Age": "86400",
+}
+
+
+@web.middleware
+async def cors_middleware(request: web.Request, handler):
+    """
+    Добавляет CORS-заголовки к КАЖДОМУ ответу, включая ошибки (404/405/500).
+    Иначе браузер скрывает реальную причину и показывает только «Failed to fetch».
+    """
+    try:
+        response = await handler(request)
+    except web.HTTPException as exc:
+        response = exc
+    except Exception:
+        logging.exception("Необработанная ошибка в %s", request.path)
+        response = error("Внутренняя ошибка сервера", 500)
+    response.headers.update(CORS_HEADERS)
+    return response
+
+
 async def handle_root(request: web.Request) -> web.Response:
     return web.Response(text="OK", status=200)
+
+
+async def handle_options(request: web.Request) -> web.Response:
+    """Ответ на preflight-запрос браузера (OPTIONS /api/order). Заголовки добавит middleware."""
+    return web.Response(status=204)
 
 
 async def handle_order(request: web.Request) -> web.Response:
@@ -268,10 +319,12 @@ async def handle_order(request: web.Request) -> web.Response:
     except (json.JSONDecodeError, ValueError):
         return error("Некорректный JSON", 400)
 
-    # 2. Проверяем подпись initData — так мы знаем, что запрос действительно из Telegram
-    user = validate_init_data(data.get("initData"), BOT_TOKEN)
+    # 2. Мягкая проверка подписи: не прошла — принимаем заказ как от Гостя
+    user, reason = validate_init_data(data.get("initData"), BOT_TOKEN)
     if user is None:
-        return error("Не удалось подтвердить пользователя Telegram. Откройте магазин из бота.", 401)
+        if guest_rate_limited(client_ip(request)):
+            return error("Слишком много заказов подряд. Попробуйте через минуту.", 429)
+        logging.warning("initData не принят (%s) — заказ принят как от Гостя", reason)
 
     # 3. Проверяем корзину
     items = data.get("items")
@@ -287,11 +340,12 @@ async def handle_order(request: web.Request) -> web.Response:
         logging.exception("Не удалось отправить заказ админу")
         return error("Не удалось передать заказ администратору", 500)
 
-    # 5. Подтверждение покупателю (если не получилось — заказ всё равно принят)
-    try:
-        await bot.send_message(user["id"], THANKS_TEXT)
-    except Exception:
-        logging.warning("Не удалось отправить подтверждение покупателю %s", user["id"])
+    # 5. Подтверждение покупателю — только если мы точно знаем, кто он
+    if user is not None:
+        try:
+            await bot.send_message(user["id"], THANKS_TEXT)
+        except Exception:
+            logging.warning("Не удалось отправить подтверждение покупателю %s", user["id"])
 
     return web.json_response({"status": "ok"})
 
@@ -302,6 +356,7 @@ async def run_web_server(bot: Bot):
     app["bot"] = bot
     app.router.add_get("/", handle_root)
     app.router.add_post("/api/order", handle_order)
+    app.router.add_options("/api/order", handle_options)
 
     runner = web.AppRunner(app)
     await runner.setup()
