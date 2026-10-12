@@ -13,6 +13,7 @@ import json
 import logging
 import os
 
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
@@ -27,9 +28,10 @@ from aiogram.types import (
 # ============================================================
 #                       НАСТРОЙКИ
 # ============================================================
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8619917318:AAG14pWgzRnjp9XSYSn8tb1qW5ofayVknow")   # токен от @BotFather
-ADMIN_ID = int(os.getenv("ADMIN_ID", "268750411"))               # ваш Telegram ID (число), узнать у @userinfobot
-WEBAPP_URL = os.getenv("WEBAPP_URL", "https://testmagazin1.vercel.app")  # ссылка на Mini App (только https)
+BOT_TOKEN = os.getenv("BOT_TOKEN", "ВСТАВЬТЕ_СЮДА_ТОКЕН_БОТА")   # токен от @BotFather
+ADMIN_ID = int(os.getenv("ADMIN_ID", "123456789"))               # ваш Telegram ID (число), узнать у @userinfobot
+WEBAPP_URL = os.getenv("WEBAPP_URL", "https://your-app.vercel.app")  # ссылка на Mini App (только https)
+PORT = int(os.getenv("PORT", "8080"))                            # порт для веб-сервера (Render задаёт PORT сам)
 # ============================================================
 
 router = Router()
@@ -186,10 +188,30 @@ async def handle_web_app_order(message: Message, bot: Bot):
     )
 
 
+# ---------- Фиктивный веб-сервер (для Render) ----------
+
+async def handle_root(request: web.Request) -> web.Response:
+    return web.Response(text="OK", status=200)
+
+
+async def run_web_server():
+    """Слушает PORT и отвечает 200 OK на '/', чтобы Render видел открытый порт."""
+    app = web.Application()
+    app.router.add_get("/", handle_root)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host="0.0.0.0", port=PORT)
+    await site.start()
+    logging.info("Веб-сервер запущен на порту %s", PORT)
+    try:
+        await asyncio.Event().wait()  # работаем бесконечно
+    finally:
+        await runner.cleanup()
+
+
 # ---------- Запуск ----------
 
-async def main():
-    logging.basicConfig(level=logging.INFO)
+async def run_bot():
     bot = Bot(
         token=BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
@@ -199,6 +221,12 @@ async def main():
 
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
+
+
+async def main():
+    logging.basicConfig(level=logging.INFO)
+    # Бот (polling) и веб-сервер работают одновременно
+    await asyncio.gather(run_bot(), run_web_server())
 
 
 if __name__ == "__main__":
