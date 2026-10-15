@@ -4,7 +4,7 @@ Telegram-бот + HTTP API для приёма заказов из Telegram Mini
 
 Заказ приходит двумя путями:
   1) POST /api/order  — основной (fetch из Mini App)
-  2) web_app_data     — запасной (sendData, работает только с кнопкой-клавиатурой из /start)
+  2) web_app_data     — запасной (sendData; сейчас не используется)
 
 Если подпись Telegram (initData) не прошла проверку, заказ всё равно принимается
 как от «Гостя», а админ видит в отчёте пометку, что личность не подтверждена.
@@ -29,19 +29,13 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart
-from aiogram.types import (
-    KeyboardButton,
-    Message,
-    ReplyKeyboardMarkup,
-    WebAppInfo,
-)
+from aiogram.types import Message, ReplyKeyboardRemove
 
 # ============================================================
 #                       НАСТРОЙКИ
 # ============================================================
 BOT_TOKEN = os.getenv("BOT_TOKEN", "ВСТАВЬТЕ_СЮДА_ТОКЕН_БОТА")   # токен от @BotFather
 ADMIN_ID = int(os.getenv("ADMIN_ID", "123456789"))               # ваш Telegram ID (число), узнать у @userinfobot
-WEBAPP_URL = os.getenv("WEBAPP_URL", "https://your-app.vercel.app")  # ссылка на Mini App (только https)
 PORT = int(os.getenv("PORT", "8080"))                            # порт веб-сервера (Render задаёт PORT сам)
 
 # CORS: откуда разрешены запросы к API. "*" — с любого домена (cookies не используются, так что это безопасно).
@@ -225,16 +219,12 @@ def build_order_report(data: dict, user=None) -> str:
 
 @router.message(CommandStart())
 async def cmd_start(message: Message):
-    keyboard = ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="🛍 Открыть магазин", web_app=WebAppInfo(url=WEBAPP_URL))]
-        ],
-        resize_keyboard=True,
-    )
+    # Только приветствие: магазин открывается через Menu Button (кнопка меню рядом с полем ввода).
+    # ReplyKeyboardRemove убирает старую кнопку «Открыть магазин» у тех, кому бот её уже показывал.
     await message.answer(
         f"Привет, {html.escape(message.from_user.first_name or 'друг')}! 👋\n\n"
-        "Нажмите кнопку ниже, чтобы открыть каталог и оформить заказ.",
-        reply_markup=keyboard,
+        "Чтобы открыть магазин, нажмите кнопку меню рядом с полем ввода сообщения.",
+        reply_markup=ReplyKeyboardRemove(),
     )
 
 
